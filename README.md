@@ -317,21 +317,6 @@ Folder data is stored in `extension_settings[card-manager]`. If you reset extens
 
 ---
 
-## Roadmap
-
-Ideas being considered for future versions. No promises, no timeline.
-
-- [ ] Per-folder cover images
-- [ ] Custom saved filter presets
-- [ ] Compact list view in addition to grid
-- [ ] Export entire folder as a single shareable bundle
-- [ ] Stats: prompt/response length histogram
-- [ ] Showcase: more built-in themes + theme import/export
-
-Open an issue on GitHub if you have a feature you'd like to see.
-
----
-
 ## Acknowledgments
 
 The folder system architecture in this extension was inspired by [ayvencore](https://github.com/ayvencore)'s [SillyTavern Lorebook Manager](https://github.com/ayvencore/SillyTavern-Lorebook-Manager). The overall folder structure concept (nested folders, drag-and-drop assignment, persistent folder state) was used as a starting reference when building Card Manager's own folder system. All code is independently written — no source code was copied.
