@@ -60,6 +60,16 @@ const DEFAULT_SETTINGS = Object.freeze({
     theme: 'default',
 });
 
+// Import safety limits — protect ST backend from accidental/hostile flooding.
+const IMPORT_MAX_FILE_SIZE = 25 * 1024 * 1024;  // 25 MB per file
+const IMPORT_MAX_COUNT = 500;                   // max queued files at once
+const IMPORT_ALLOWED_MIME = new Set([
+    'image/png',
+    'application/json',
+    'text/json',
+    '',  // some browsers omit MIME for dragged files; we still check extension
+]);
+
 const state = {
     initialized: false,
     isOpen: false,
@@ -130,21 +140,45 @@ function getRequestHeaders() {
     return { 'Content-Type': 'application/json', 'X-CSRF-Token': document.querySelector('meta[name="csrf-token"]')?.content || '' };
 }
 
-// Robust confirmation popup - works across ST versions
+// HTML-escape helper (mirrors escapeHtml declared below; duplicated here
+// because cmConfirm is called from paths that execute before the other
+// file sections are reached during initial module parse).
+function _cmEscape(str) {
+    const div = document.createElement('div');
+    div.textContent = String(str ?? '');
+    return div.innerHTML;
+}
+
+// Robust confirmation popup - works across ST versions.
+// The Popup/callPopup paths render msg as HTML, so attacker-controlled
+// card/folder names MUST be escaped. We escape first, then convert \n to <br>
+// as a presentation-only transformation.
 async function cmConfirm(msg) {
+    const safeHtml = _cmEscape(msg).replace(/\n/g, '<br>');
     try {
         const ctx = getContext();
         if (ctx.Popup?.show?.confirm) {
-            return !!(await ctx.Popup.show.confirm('Confirm', msg.replace(/\n/g, '<br>')));
+            return !!(await ctx.Popup.show.confirm('Confirm', safeHtml));
         }
     } catch(e) { /* fall through */ }
     try {
         if (typeof callPopup === 'function') {
-            return !!(await callPopup(msg, 'confirm'));
+            return !!(await callPopup(safeHtml, 'confirm'));
         }
     } catch(e) { /* fall through */ }
-    return confirm(msg);
+    // Native confirm() uses plain text — pass the raw message
+    return confirm(String(msg ?? ''));
 }
+
+// Toastr wrapper: forces escapeHtml per-call so attacker-controlled
+// card names/folder names cannot execute JS even if the global toastr
+// is configured with escapeHtml:false.
+const safeToastr = {
+    success: (msg, title) => (typeof toastr !== 'undefined') && toastr.success?.(_cmEscape(msg), title, { escapeHtml: true }),
+    info:    (msg, title, opts) => (typeof toastr !== 'undefined') && toastr.info?.(_cmEscape(msg), title, Object.assign({ escapeHtml: true }, opts || {})),
+    warning: (msg, title) => (typeof toastr !== 'undefined') && toastr.warning?.(_cmEscape(msg), title, { escapeHtml: true }),
+    error:   (msg, title) => (typeof toastr !== 'undefined') && toastr.error?.(_cmEscape(msg), title, { escapeHtml: true }),
+};
 
 // Non-blocking prompt popup - replaces native prompt()
 async function cmPrompt(msg, defaultValue = '') {
@@ -226,10 +260,10 @@ function loadPersistedState() {
     state.showcaseTheme = settings.showcaseTheme || 'default';
     state.showcaseCustomAccent = settings.showcaseCustomAccent || '#e0a030';
     state.showcaseCustomBg = settings.showcaseCustomBg || '#1a1a1e';
-    state.showcaseCustomFontHeading = settings.showcaseCustomFontHeading || 'system-ui';
-    state.showcaseCustomFontName = settings.showcaseCustomFontName || 'system-ui';
-    state.showcaseCustomFontBody = settings.showcaseCustomFontBody || 'system-ui';
-    state.showcaseCustomFontLabel = settings.showcaseCustomFontLabel || 'system-ui';
+    state.showcaseCustomFontHeading = _safeFontName(settings.showcaseCustomFontHeading);
+    state.showcaseCustomFontName = _safeFontName(settings.showcaseCustomFontName);
+    state.showcaseCustomFontBody = _safeFontName(settings.showcaseCustomFontBody);
+    state.showcaseCustomFontLabel = _safeFontName(settings.showcaseCustomFontLabel);
     state.showcaseAvatarSize = settings.showcaseAvatarSize || 'medium';
     state.showcaseFontStep = settings.showcaseFontStep ?? 3;
     state.showcaseLayout = settings.showcaseLayout || 'card';
@@ -1971,7 +2005,7 @@ function openBulkFolderPicker(anchorEl) {
         const chars = getSelectedCharacters();
         chars.forEach(c => assignCardToFolder(c.avatar, null));
         closeBulkFolderPicker();
-        toastr?.success?.(`${chars.length} card(s) removed from folders`);
+        safeToastr.success(`${chars.length} card(s) removed from folders`);
         renderManager();
     });
     list.appendChild(noRow);
@@ -1988,7 +2022,7 @@ function openBulkFolderPicker(anchorEl) {
                 const chars = getSelectedCharacters();
                 chars.forEach(c => assignCardToFolder(c.avatar, folder.id));
                 closeBulkFolderPicker();
-                toastr?.success?.(`${chars.length} card(s) moved to "${folder.name}"`);
+                safeToastr.success(`${chars.length} card(s) moved to "${folder.name}"`);
                 renderManager();
             });
             list.appendChild(row);
@@ -2469,6 +2503,18 @@ const SHOWCASE_FONTS = [
     { name: 'Orbitron', category: 'display', google: true },
 ];
 
+// Whitelist guard for font names. Any font value that flows into a CSS
+// declaration MUST pass through this. Rejects:
+//   - non-strings
+//   - values not present in SHOWCASE_FONTS
+// Returns 'system-ui' as the safe fallback. This prevents CSS injection
+// if state ever contains a malformed value (e.g. from a tampered settings
+// export, a corrupted sync, or a third-party script writing to state).
+const _SHOWCASE_FONT_NAMES = new Set(SHOWCASE_FONTS.map(f => f.name));
+function _safeFontName(name) {
+    return (typeof name === 'string' && _SHOWCASE_FONT_NAMES.has(name)) ? name : 'system-ui';
+}
+
 const _loadedFonts = new Set();
 const _loadingFonts = new Set();
 const _fontListeners = [];
@@ -2482,6 +2528,9 @@ async function loadHtml2Canvas() {
     return new Promise(resolve => {
         const script = document.createElement('script');
         script.src = 'https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js';
+        script.integrity = 'sha384-ZZ1pncU3bQe8y31yfZdMFdSpttDoPmOZg2wguVK9almUodir1PghgT0eY7Mrty8H';
+        script.crossOrigin = 'anonymous';
+        script.referrerPolicy = 'no-referrer';
         script.setAttribute('data-html2canvas', '1');
         script.onload = () => { _html2canvasLoaded = true; resolve(true); };
         script.onerror = () => resolve(false);
@@ -2490,10 +2539,10 @@ async function loadHtml2Canvas() {
 }
 
 async function screenshotShowcase(profileEl) {
-    if (!profileEl) { toastr?.warning?.('No card to capture.'); return; }
-    toastr?.info?.('Capturing card...');
+    if (!profileEl) { safeToastr.warning('No card to capture.'); return; }
+    safeToastr.info('Capturing card...');
     if (!(await loadHtml2Canvas())) {
-        toastr?.error?.('Failed to load screenshot library.');
+        safeToastr.error('Failed to load screenshot library.');
         return;
     }
     try {
@@ -2542,14 +2591,17 @@ async function screenshotShowcase(profileEl) {
         document.body.appendChild(link);
         link.click();
         document.body.removeChild(link);
-        toastr?.success?.('Card saved as PNG!');
+        safeToastr.success('Card saved as PNG!');
     } catch (e) {
         console.error('[card-manager] Screenshot failed:', e);
-        toastr?.error?.('Screenshot failed: ' + e.message);
+        safeToastr.error('Screenshot failed: ' + e.message);
     }
 }
 
 function loadGoogleFont(fontName, onLoad) {
+    // Reject anything not in the whitelist — never build a Google Fonts URL
+    // from arbitrary state.
+    fontName = _safeFontName(fontName);
     if (!fontName || fontName === 'system-ui') { onLoad?.(); return; }
     if (_loadedFonts.has(fontName)) { onLoad?.(); return; }
     const id = 'gf-' + fontName.replace(/\s+/g, '-').toLowerCase();
@@ -2694,10 +2746,17 @@ function renderShowcaseTab() {
         showcase.style.setProperty('--sc-bg', state.showcaseCustomBg);
         showcase.style.setProperty('--sc-surface', state.showcaseCustomBg);
         showcase.style.setProperty('--sc-accent-soft', state.showcaseCustomAccent + '22');
-        const hf = state.showcaseCustomFontHeading !== 'system-ui' ? "'" + state.showcaseCustomFontHeading + "', " : '';
-        const bf = state.showcaseCustomFontBody !== 'system-ui' ? "'" + state.showcaseCustomFontBody + "', " : '';
-        const lf = state.showcaseCustomFontLabel !== 'system-ui' ? "'" + state.showcaseCustomFontLabel + "', " : '';
-        const nf = state.showcaseCustomFontName !== 'system-ui' ? "'" + state.showcaseCustomFontName + "', " : '';
+        // Validate every font name at the sink — guard against any code path
+        // (settings import, 3rd-party state mutation) that might slip an
+        // unwhitelisted value into state.
+        const hName = _safeFontName(state.showcaseCustomFontHeading);
+        const bName = _safeFontName(state.showcaseCustomFontBody);
+        const lName = _safeFontName(state.showcaseCustomFontLabel);
+        const nName = _safeFontName(state.showcaseCustomFontName);
+        const hf = hName !== 'system-ui' ? "'" + hName + "', " : '';
+        const bf = bName !== 'system-ui' ? "'" + bName + "', " : '';
+        const lf = lName !== 'system-ui' ? "'" + lName + "', " : '';
+        const nf = nName !== 'system-ui' ? "'" + nName + "', " : '';
         showcase.style.setProperty('--sc-ff-name', nf + 'system-ui, sans-serif');
         showcase.style.setProperty('--sc-ff-heading', hf + 'system-ui, sans-serif');
         showcase.style.setProperty('--sc-ff-body', bf + 'system-ui, sans-serif');
@@ -2916,31 +2975,37 @@ if (!state.showcaseCleanMode) controlsPanel.appendChild(themeRow);
         const fontPreview = document.createElement('div');
         fontPreview.className = 'cm-showcase-font-preview';
 
+        // All font names pass through _safeFontName at the CSS sink.
+        const nmFontName = _safeFontName(state.showcaseCustomFontName);
+        const hFontName = _safeFontName(state.showcaseCustomFontHeading);
+        const lFontName = _safeFontName(state.showcaseCustomFontLabel);
+        const bFontName = _safeFontName(state.showcaseCustomFontBody);
+
         const previewName = document.createElement('div');
         previewName.className = 'cm-showcase-font-preview-name';
         previewName.textContent = 'Display Name';
         previewName.style.wordBreak = 'break-word';
-        const nmFont = state.showcaseCustomFontName !== 'system-ui' ? "'" + state.showcaseCustomFontName + "', " : '';
+        const nmFont = nmFontName !== 'system-ui' ? "'" + nmFontName + "', " : '';
         previewName.style.fontFamily = nmFont + 'system-ui, sans-serif';
 
         const previewHeading = document.createElement('div');
         previewHeading.className = 'cm-showcase-font-preview-heading';
         previewHeading.textContent = 'Character Name';
         previewHeading.style.wordBreak = 'break-word';
-        const hFont = state.showcaseCustomFontHeading !== 'system-ui' ? "'" + state.showcaseCustomFontHeading + "', " : '';
+        const hFont = hFontName !== 'system-ui' ? "'" + hFontName + "', " : '';
         previewHeading.style.fontFamily = hFont + 'system-ui, sans-serif';
 
         const previewLabel = document.createElement('div');
         previewLabel.className = 'cm-showcase-font-preview-label';
         previewLabel.textContent = '≡ DESCRIPTION';
-        const lFont = state.showcaseCustomFontLabel !== 'system-ui' ? "'" + state.showcaseCustomFontLabel + "', " : '';
+        const lFont = lFontName !== 'system-ui' ? "'" + lFontName + "', " : '';
         previewLabel.style.fontFamily = lFont + 'system-ui, sans-serif';
 
         const previewBody = document.createElement('div');
         previewBody.className = 'cm-showcase-font-preview-body';
         previewBody.textContent = 'The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs.';
         previewBody.style.wordBreak = 'break-word';
-        const bFont = state.showcaseCustomFontBody !== 'system-ui' ? "'" + state.showcaseCustomFontBody + "', " : '';
+        const bFont = bFontName !== 'system-ui' ? "'" + bFontName + "', " : '';
         previewBody.style.fontFamily = bFont + 'system-ui, sans-serif';
 
         // Loading indicator
@@ -3442,6 +3507,10 @@ function bindImportEvents() {
     });
     document.getElementById('cm-import-cancel')?.addEventListener('click', () => {
         state.importCancelled = true;
+        // Abort the in-flight fetch too so cancel isn't stuck waiting for a hung request.
+        if (state._importController) {
+            try { state._importController.abort(); } catch (_) {}
+        }
     });
 }
 
@@ -3450,10 +3519,15 @@ async function handleImportFiles(fileList) {
 
     const validExts = ['png', 'json'];
     const newFiles = [];
+    const rejects = { ext: 0, mime: 0, size: 0 };
 
     for (const file of fileList) {
         const ext = file.name.split('.').pop().toLowerCase();
-        if (!validExts.includes(ext)) continue;
+        if (!validExts.includes(ext)) { rejects.ext++; continue; }
+        // MIME type check (defense-in-depth; server re-validates)
+        if (file.type && !IMPORT_ALLOWED_MIME.has(file.type)) { rejects.mime++; continue; }
+        // Per-file size cap
+        if (file.size > IMPORT_MAX_FILE_SIZE) { rejects.size++; continue; }
 
         // Detect name from filename (strip extension)
         const detectedName = file.name.replace(/\.[^.]+$/, '').replace(/[_-]/g, ' ').trim() || 'Unknown';
@@ -3466,8 +3540,23 @@ async function handleImportFiles(fileList) {
     }
 
     if (newFiles.length === 0) {
-        toastr?.warning?.('No valid character files found. Supported: PNG, JSON');
+        let msg = 'No valid character files found. Supported: PNG, JSON.';
+        if (rejects.size) msg += ` ${rejects.size} file(s) exceed ${IMPORT_MAX_FILE_SIZE / 1048576} MB limit.`;
+        if (rejects.mime) msg += ` ${rejects.mime} file(s) had wrong MIME type.`;
+        safeToastr.warning(msg);
         return;
+    }
+
+    // Queue-size cap
+    const wouldQueue = state.importFiles.length + newFiles.length;
+    if (wouldQueue > IMPORT_MAX_COUNT) {
+        const keep = Math.max(0, IMPORT_MAX_COUNT - state.importFiles.length);
+        newFiles.length = keep;
+        safeToastr.warning(`Import queue capped at ${IMPORT_MAX_COUNT} files. Accepted ${keep} of this batch.`);
+    }
+
+    if (rejects.size > 0) {
+        safeToastr.warning(`${rejects.size} file(s) rejected (exceed ${IMPORT_MAX_FILE_SIZE / 1048576} MB).`);
     }
 
     state.importFiles = [...state.importFiles, ...newFiles];
@@ -3511,6 +3600,9 @@ async function runImport() {
             break;
         }
 
+        // Per-file AbortController so the Cancel button can abort hung requests.
+        state._importController = new AbortController();
+
         try {
             const formData = new FormData();
             formData.append('avatar', entry.file, entry.file.name);
@@ -3526,6 +3618,7 @@ async function runImport() {
                 method: 'POST',
                 headers,
                 body: formData,
+                signal: state._importController.signal,
             });
 
             if (!resp.ok) {
@@ -3533,12 +3626,21 @@ async function runImport() {
                 throw new Error('HTTP ' + resp.status + (text ? ': ' + text.slice(0, 120) : ''));
             }
 
-            // Server returns { file_name } on success or { error: true } on failure
+            // Server returns { file_name } on success or { error: true } on failure.
+            // Explicit shape validation: require resp.ok AND a file_name field.
             const result = await resp.json().catch(() => null);
-            if (result && result.error) throw new Error('Server error (invalid character card?)');
+            if (!result) throw new Error('Server returned non-JSON response');
+            if (result.error) throw new Error(String(result.errorMessage || 'invalid character card'));
+            if (!result.file_name) throw new Error('Server response missing file_name');
 
         } catch (err) {
+            if (err.name === 'AbortError') {
+                errors.push({ name: '(cancelled)', error: 'Import cancelled at ' + completed + '/' + total });
+                break;
+            }
             errors.push({ name: entry.detectedName, error: err.message || 'Unknown error' });
+        } finally {
+            state._importController = null;
         }
 
         completed++;
@@ -3576,7 +3678,7 @@ async function runImport() {
     state.importFiles = [];
 
     if (successCount > 0) {
-        toastr?.success?.('Imported ' + successCount + ' character cards.');
+        safeToastr.success('Imported ' + successCount + ' character cards.');
         // Refresh ST's character list so ctx.characters is up-to-date
         try {
             const ctx2 = getContext();
@@ -3597,7 +3699,7 @@ async function runImport() {
         await refreshData(false);
     }
     if (errors.length > 0) {
-        toastr?.warning?.(errors.length + ' imports failed.');
+        safeToastr.warning(errors.length + ' imports failed.');
     }
 
     renderImportTab();
@@ -3879,16 +3981,24 @@ function renderExportTab() {
 
 async function ensureJSZip() {
     if (window.JSZip) return window.JSZip;
-    // Try loading from ST's bundled lib or CDN
+    // Try loading from ST's bundled lib (same-origin, no SRI needed) then CDN with SRI.
     const sources = [
-        '/lib/jszip.min.js',
-        'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js',
+        { src: '/lib/jszip.min.js' },
+        {
+            src: 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js',
+            integrity: 'sha384-+mbV2IY1Zk/X1p/nWllGySJSUN8uMs+gUAN10Or95UBH0fpj6GfKgPmgC5EXieXG',
+            crossOrigin: 'anonymous',
+            referrerPolicy: 'no-referrer',
+        },
     ];
-    for (const src of sources) {
+    for (const s of sources) {
         try {
             await new Promise((resolve, reject) => {
                 const script = document.createElement('script');
-                script.src = src;
+                script.src = s.src;
+                if (s.integrity) script.integrity = s.integrity;
+                if (s.crossOrigin) script.crossOrigin = s.crossOrigin;
+                if (s.referrerPolicy) script.referrerPolicy = s.referrerPolicy;
                 script.onload = resolve;
                 script.onerror = reject;
                 document.head.appendChild(script);
@@ -3901,17 +4011,17 @@ async function ensureJSZip() {
 
 async function runZipExport(mode) {
   try {
-    if (state.exportInProgress) { toastr?.info?.('Export already in progress.'); return; }
+    if (state.exportInProgress) { safeToastr.info('Export already in progress.'); return; }
 
     let chars;
     switch (mode) {
         case 'selected':
             chars = getSelectedCharacters();
-            if (chars.length === 0) { toastr?.info?.('No cards selected.'); return; }
+            if (chars.length === 0) { safeToastr.info('No cards selected.'); return; }
             break;
         case 'filtered':
             chars = getVisibleCards();
-            if (chars.length === 0) { toastr?.info?.('No cards match current filters.'); return; }
+            if (chars.length === 0) { safeToastr.info('No cards match current filters.'); return; }
             break;
         case 'all':
         default:
@@ -3923,7 +4033,7 @@ async function runZipExport(mode) {
     try {
         JSZipLib = await ensureJSZip();
     } catch (err) {
-        toastr?.error?.(err.message);
+        safeToastr.error(err.message);
         return;
     }
 
@@ -4014,7 +4124,7 @@ async function runZipExport(mode) {
         a.click();
         document.body.removeChild(a);
         URL.revokeObjectURL(a.href);
-        toastr?.success?.(`Exported ${completed - errors.length} cards as ${zipFilename}`);
+        safeToastr.success(`Exported ${completed - errors.length} cards as ${zipFilename}`);
     }
 
     // Errors
@@ -4046,7 +4156,7 @@ async function runZipExport(mode) {
     renderExportTab();
 } catch (err) {
         console.error('[CardManager] Export failed:', err);
-        toastr?.error?.('Export failed: ' + (err.message || 'Unknown error'));
+        safeToastr.error('Export failed: ' + (err.message || 'Unknown error'));
         state.exportInProgress = false;
         state.exportCancelled = false;
     }
@@ -4130,10 +4240,10 @@ function navigateToCharacter(charRecord) {
         } else if (typeof window.selectCharacterById === 'function') {
             window.selectCharacterById(charRecord.index);
         } else {
-            toastr?.info?.(`Select "${charRecord.name}" manually.`);
+            safeToastr.info(`Select "${charRecord.name}" manually.`);
             return;
         }
-        toastr?.success?.(`Switched to ${charRecord.name}`);
+        safeToastr.success(`Switched to ${charRecord.name}`);
     } catch (err) {
         console.error(`[${MODULE_NAME}] Failed to navigate`, err);
     }
@@ -4142,7 +4252,7 @@ function navigateToCharacter(charRecord) {
 async function exportSingleCard(charRecord) {
     if (state._exportingCard) return;
     state._exportingCard = true;
-    toastr?.info?.(`Exporting ${charRecord.name}...`, '', { timeOut: 15000, extendedTimeOut: 0, tapToDismiss: false });
+    safeToastr.info(`Exporting ${charRecord.name}...`, '', { timeOut: 15000, extendedTimeOut: 0, tapToDismiss: false });
     try {
         const headers = getRequestHeaders();
         const resp = await fetch('/api/characters/export', {
@@ -4160,11 +4270,11 @@ async function exportSingleCard(charRecord) {
         document.body.removeChild(a);
         URL.revokeObjectURL(a.href);
         toastr?.clear?.();
-        toastr?.success?.(`Exported ${charRecord.name}`);
+        safeToastr.success(`Exported ${charRecord.name}`);
     } catch (err) {
         console.error(`[${MODULE_NAME}] Export failed`, err);
         toastr?.clear?.();
-        toastr?.error?.(`Failed to export ${charRecord.name}`);
+        safeToastr.error(`Failed to export ${charRecord.name}`);
     } finally {
         state._exportingCard = false;
     }
@@ -4180,11 +4290,11 @@ async function deleteSingleCard(charRecord) {
             body: JSON.stringify({ avatar_url: charRecord.avatar }),
         });
         if (!resp.ok) throw new Error(`Delete failed (${resp.status})`);
-        toastr?.success?.(`Deleted ${charRecord.name}`);
+        safeToastr.success(`Deleted ${charRecord.name}`);
         await refreshData(false);
     } catch (err) {
         console.error(`[${MODULE_NAME}] Delete failed`, err);
-        toastr?.error?.(`Failed to delete ${charRecord.name}`);
+        safeToastr.error(`Failed to delete ${charRecord.name}`);
     }
 }
 
@@ -4220,7 +4330,7 @@ function onInvertSelection() {
 async function onBulkExport() {
     if (state.isBulkOperating) return;
     const selected = getSelectedCharacters();
-    if (selected.length === 0) { toastr?.info?.('No cards selected.'); return; }
+    if (selected.length === 0) { safeToastr.info('No cards selected.'); return; }
 
     const count = selected.length;
     if (!(await cmConfirm(`Export ${count} card(s) as individual PNG files?`))) return;
@@ -4259,13 +4369,13 @@ async function onBulkExport() {
     state.isBulkOperating = false;
     clearBulkProgress();
 
-    if (success > 0) toastr?.success?.(`Exported ${success} card(s).`);
-    if (failed > 0) toastr?.warning?.(`Failed to export ${failed} card(s).`);
+    if (success > 0) safeToastr.success(`Exported ${success} card(s).`);
+    if (failed > 0) safeToastr.warning(`Failed to export ${failed} card(s).`);
 }
 async function onBulkDelete() {
     if (state.isBulkOperating) return;
     const selected = getSelectedCharacters();
-    if (selected.length === 0) { toastr?.info?.('No cards selected.'); return; }
+    if (selected.length === 0) { safeToastr.info('No cards selected.'); return; }
 
     const count = selected.length;
     const names = selected.slice(0, 5).map(c => c.name).join(', ');
@@ -4298,8 +4408,8 @@ async function onBulkDelete() {
 
     state.isBulkOperating = false;
 
-    if (success > 0) toastr?.success?.(`Deleted ${success} card(s).`);
-    if (failed > 0) toastr?.warning?.(`Failed to delete ${failed} card(s).`);
+    if (success > 0) safeToastr.success(`Deleted ${success} card(s).`);
+    if (failed > 0) safeToastr.warning(`Failed to delete ${failed} card(s).`);
 
     await refreshData(false);
 }
