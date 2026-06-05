@@ -1,6 +1,6 @@
 {
   "display_name": "⊹ CARD MANAGER ⊹",
-  "loading_order": 1,
+  "loading_order": 50,
   "requires": [],
   "optional": [],
   "js": "index.js",
